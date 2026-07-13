@@ -1,0 +1,31 @@
+log_level: INFO
+metrics_enabled: true
+
+agents:
+  - name: researcher
+    role: research
+    description: Gathers and summarizes information
+    tools:
+      - search
+      - summarize
+
+  - name: writer
+    role: content
+    description: Produces written output from briefs
+    tools:
+      - draft
+
+workflows:
+  - name: content_pipeline
+    description: Research a topic then draft content
+    steps:
+      - name: research
+        agent: researcher
+        input:
+          query: $topic
+      - name: draft
+        agent: writer
+        input:
+          brief: $research
+        depends_on:
+          - research
