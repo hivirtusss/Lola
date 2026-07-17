@@ -57,6 +57,32 @@ OTP_KEYWORD = re.compile(r"otp|one.?time|verification|verify|code|password|pin",
 OTP_DIGIT = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
 
 # ===== KEYBOARDS =====
+WELCOME_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("👥 Set Group/Channel")],
+        [KeyboardButton("❓ Help")],
+    ],
+    resize_keyboard=True,
+)
+
+FIREBASE_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("🔥 Set Firebase URL")],
+        [KeyboardButton("👥 Set Group/Channel")],
+        [KeyboardButton("❓ Help")],
+    ],
+    resize_keyboard=True,
+)
+
+DEVICE_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("📱 Online Devices")],
+        [KeyboardButton("🔥 Set Firebase URL"), KeyboardButton("👥 Set Group/Channel")],
+        [KeyboardButton("❓ Help")],
+    ],
+    resize_keyboard=True,
+)
+
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("▶️ Start Listen")],
@@ -67,20 +93,10 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-SETUP_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("📱 Online Devices")],
-        [KeyboardButton("🔥 Set Firebase URL")],
-        [KeyboardButton("👥 Change")],
-        [KeyboardButton("📊 Status"), KeyboardButton("❓ Help")],
-    ],
-    resize_keyboard=True,
-)
-
 SIM_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🔢 Select SIM")],
-        [KeyboardButton("📱 Change Device"), KeyboardButton("📊 Status")],
+        [KeyboardButton("📱 Online Devices"), KeyboardButton("📊 Status")],
     ],
     resize_keyboard=True,
 )
@@ -154,6 +170,31 @@ def get_config(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> UserConfig:
             cfg.bot_token = BOT_TOKEN
         context.user_data["config"] = cfg
     return context.user_data["config"]
+
+
+def get_reply_keyboard(cfg: UserConfig) -> ReplyKeyboardMarkup:
+    if cfg.step == "ready" and cfg.device_id and cfg.sim in ("1", "2"):
+        return MAIN_KEYBOARD
+    if cfg.device_id and cfg.step == "sim":
+        return SIM_KEYBOARD
+    if cfg.firebase_url:
+        return DEVICE_KEYBOARD
+    if cfg.chat_id:
+        return FIREBASE_KEYBOARD
+    return WELCOME_KEYBOARD
+
+
+def parse_tme_link(text: str) -> int | None:
+    """t.me/c/1234567890 → -1001234567890"""
+    if "/c/" not in text:
+        return None
+    try:
+        part = text.split("/c/")[1].split("/")[0].split("?")[0]
+        if part.isdigit():
+            return int(f"-100{part}")
+    except (IndexError, ValueError):
+        pass
+    return None
 
 
 def mask_token(token: str) -> str:
@@ -325,36 +366,36 @@ def fetch_online_devices(firebase_url: str) -> list[str]:
 
 
 def build_device_list_text(devices: list[DeviceInfo]) -> str:
-    if not devices:
-        return "❌ Koi device nahi mila Firebase mein."
+    online = [d for d in devices if d.online]
+    if not online:
+        return "❌ Koi *online* device nahi.\n\nFirebase `clients` node check karo."
 
-    lines = ["📱 *Devices* _(real-time)_\n"]
-    online_n = sum(1 for d in devices if d.online)
-    lines.append(f"🟢 Online: {online_n} | 🔴 Offline: {len(devices) - online_n}\n")
-
-    for dev in devices:
-        icon = "🟢" if dev.online else "🔴"
-        status = "Online" if dev.online else "Offline"
-        if dev.sim_labels:
-            nums = " · ".join(dev.sim_labels)
-            lines.append(f"{icon} *{nums}* — {status}")
-        else:
-            lines.append(f"{icon} `{dev.device_id[:12]}...` — {status}")
-
-    lines.append("\n_Tap number to select online device_")
+    lines = [f"🟢 *Online Devices ({len(online)})*\n"]
+    for i, dev in enumerate(online, 1):
+        lines.append(f"{i}. `{dev.device_id}`")
+    lines.append("\n_Number bhejo (jaise `3`) ya neeche button dabao_")
     return "\n".join(lines)
 
 
 def build_device_keyboard(devices: list[DeviceInfo]) -> InlineKeyboardMarkup:
-    buttons = []
-    for dev in devices[:20]:
-        if dev.sim_labels:
-            label = f"{'🟢' if dev.online else '🔴'} {' '.join(dev.sim_labels)}"
-        else:
-            label = f"{'🟢' if dev.online else '🔴'} {dev.device_id[:10]}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"dev:{dev.device_id}")])
+    online = [d for d in devices if d.online]
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+
+    for i, dev in enumerate(online[:60], 1):
+        row.append(InlineKeyboardButton(str(i), callback_data=f"pick:{i}"))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
     buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_devices")])
     return InlineKeyboardMarkup(buttons)
+
+
+def store_device_picker(context: ContextTypes.DEFAULT_TYPE, devices: list[DeviceInfo]) -> None:
+    context.user_data["pick_devices"] = [d.device_id for d in devices if d.online]
 
 
 def build_sim_keyboard(device: DeviceInfo) -> InlineKeyboardMarkup:
@@ -477,16 +518,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     persist_config(update.effective_user.id, cfg)
 
     await update.message.reply_text(
-        "🚀 *VIRTUS AUTO TOKEN*\n\n"
-        "Setup steps:\n"
-        "1️⃣ 👥 Change → Chat ID / Bot Token change karo\n"
-        "2️⃣ 🔥 Change Firebase → Firebase URL daalo (uske devices dikhenge)\n"
-        "3️⃣ 📱 Change Device → online device select karo\n"
-        "4️⃣ 🔢 Select SIM → number choose karo (58, 70...)\n"
-        "5️⃣ ▶️ Start Listen → listening shuru\n\n"
-        "Pehle *👥 Change* dabao aur apna group/channel set karo.",
+        "👋 *Welcome!*\n\n"
+        "*Step 1:* Set group or channel first. This chat is saved for all future Firebase setups.\n"
+        "Tap 👥 Set Group/Channel or send /setgroup",
         parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=get_reply_keyboard(cfg),
     )
 
 
@@ -514,7 +550,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = get_config(update.effective_user.id, context)
-    await update.message.reply_text(status_text(cfg), reply_markup=MAIN_KEYBOARD)
+    await update.message.reply_text(status_text(cfg), reply_markup=get_reply_keyboard(cfg))
 
 
 async def cmd_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -534,15 +570,17 @@ async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     cfg.waiting_for = "chat_id"
     persist_config(update.effective_user.id, cfg)
     await update.message.reply_text(
-        "📌 *Change Chat ID*\n\n"
-        "Ye chat sab future Firebase setups ke liye save hogi.\n\n"
-        "Bhejo:\n"
-        "• Group se koi message *forward* karo\n"
-        "• `@username` bhejo\n"
-        "• Numeric chat ID (jaise `-1003553669855`)\n"
-        "• Invite link `t.me/...`",
+        "👥 *Set Group or Channel*\n\n"
+        "This chat will be saved for all future Firebase setups.\n\n"
+        "Send one of:\n"
+        "• Forward any message from the group/channel\n"
+        "• `@username`\n"
+        "• Numeric chat ID (e.g. `-1001234567890`)\n"
+        "• Public link: `https://t.me/groupname`\n"
+        "• Private link: `https://t.me/c/1234567890`\n\n"
+        "Or add bot as admin to the group/channel and run /setgroup there.",
         parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=get_reply_keyboard(cfg),
     )
 
 
@@ -567,7 +605,7 @@ async def cmd_setfirebase(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "🔥 *Send your Firebase Realtime Database URL*\n\n"
         "Example:\n`https://your-project-default-rtdb.firebaseio.com`",
         parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=get_reply_keyboard(cfg),
     )
 
 
@@ -581,13 +619,12 @@ async def save_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id:
     persist_config(user_id, cfg)
 
     await update.message.reply_text(
-        f"✅ Chat ID saved: `{chat_id}`\n"
-        f"✅ Chat Name: *{chat_name}*\n"
+        f"✅ Chat saved: *{chat_name}*\n"
         f"📌 Kept for all Firebase setups.\n\n"
-        f"Step 2: Firebase URL set karo.\n"
-        f"Tap *🔥 Change Firebase* ya /setfirebase bhejo.",
+        f"*Step 2:* Set your Firebase URL.\n"
+        f"Tap 🔥 Set Firebase URL or send /setfirebase",
         parse_mode="Markdown",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=get_reply_keyboard(cfg),
     )
 
 
@@ -632,19 +669,21 @@ async def save_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
 
     persist_config(user_id, cfg)
 
+    chat_line = f"📌 Group/channel unchanged: *{cfg.chat_name}*\n\n" if cfg.chat_name else ""
+
     msg = (
         f"✅ Firebase URL saved!\n"
-        f"`{cfg.firebase_url}`\n\n"
+        f"`{cfg.firebase_url}`\n"
+        f"{chat_line}"
     )
     if connected:
-        msg += "✅ Firebase connected!\n\n"
+        msg += f"✅ Firebase connected!\n📌 Saved chat: *{cfg.chat_name or '—'}*\n\n"
     else:
         msg += "⚠️ Firebase connect check fail — URL verify karo.\n\n"
 
-    msg += "📱 Is Firebase ke devices neeche dikhe rahe hain..."
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+    msg += "*Step 3:* Select an online device.\nTap 📱 Online Devices"
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_reply_keyboard(cfg))
 
-    # Turant naye Firebase ke devices dikhao
     await show_devices(update, context)
 
 
@@ -670,8 +709,49 @@ async def show_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     text = build_device_list_text(devices)
     keyboard = build_device_keyboard(devices)
-    msg = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    store_device_picker(context, devices)
+    msg = await update.message.reply_text(
+        text, parse_mode="Markdown", reply_markup=keyboard
+    )
     device_list_watch[user_id] = (msg.chat_id, msg.message_id, cfg.firebase_url)
+
+
+async def select_device(update: Update, context: ContextTypes.DEFAULT_TYPE, index: int) -> None:
+    user_id = update.effective_user.id
+    cfg = get_config(user_id, context)
+    picks: list[str] = context.user_data.get("pick_devices", [])
+
+    if index < 1 or index > len(picks):
+        target = update.callback_query.message if update.callback_query else update.message
+        await target.reply_text(f"❌ Invalid number. 1 se {len(picks)} ke beech bhejo.")
+        return
+
+    device_id = picks[index - 1]
+    loop = asyncio.get_running_loop()
+    device = await loop.run_in_executor(EXECUTOR, get_device_by_id, cfg.firebase_url, device_id)
+
+    cfg.device_id = device_id
+    cfg.step = "sim"
+    persist_config(user_id, cfg)
+    device_list_watch.pop(user_id, None)
+
+    chat = update.callback_query.message.chat_id if update.callback_query else update.effective_chat.id
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            f"✅ Device selected: `{device_id}`", parse_mode="Markdown"
+        )
+
+    await context.bot.send_message(
+        chat_id=chat,
+        text=(
+            f"✅ Device: `{device_id}`\n"
+            f"📌 Saved chat: *{cfg.chat_name or '—'}*\n\n"
+            "*Step 4:* Select SIM slot.\nTap 🔢 Select SIM"
+        ),
+        parse_mode="Markdown",
+        reply_markup=SIM_KEYBOARD,
+    )
 
 
 async def show_sim_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -769,6 +849,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
+    if data.startswith("pick:"):
+        await query.answer()
+        idx = int(data.split(":")[1])
+        if "pick_devices" not in context.user_data and cfg.firebase_url:
+            loop = asyncio.get_running_loop()
+            devices = await loop.run_in_executor(EXECUTOR, fetch_all_devices, cfg.firebase_url)
+            store_device_picker(context, devices)
+        await select_device(update, context, idx)
+        return
+
     if data.startswith("dev:"):
         device_id = data[4:]
         loop = asyncio.get_running_loop()
@@ -815,6 +905,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         devices = await loop.run_in_executor(EXECUTOR, fetch_all_devices, firebase_url)
         text = build_device_list_text(devices)
         keyboard = build_device_keyboard(devices)
+        store_device_picker(context, devices)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
         device_list_watch[user_id] = (query.message.chat_id, query.message.message_id, firebase_url)
         return
@@ -833,9 +924,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             chat_id=query.message.chat_id,
             text=(
                 "✅ *All set!*\n"
-                f"📌 Number: *{sim_label}*\n"
                 f"📌 Saved chat: *{cfg.chat_name or '—'}*\n\n"
-                "Step 5: Start listening.\nTap *▶️ Start Listen*"
+                "*Step 5:* Start listening.\nTap ▶️ Start Listen"
             ),
             parse_mode="Markdown",
             reply_markup=MAIN_KEYBOARD,
@@ -863,6 +953,9 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if text in ("👥 Change", "Change"):
         await cmd_change(update, context)
+        return
+    if text in ("👥 Set Group/Channel", "Set Group/Channel"):
+        await cmd_setgroup(update, context)
         return
     if text in ("📊 Status", "Status"):
         await cmd_status(update, context)
@@ -910,6 +1003,12 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _handle_chat_id_input(update, context, text)
         return
 
+    # Device list se number select (1, 2, 3...)
+    picks: list[str] = context.user_data.get("pick_devices", [])
+    if picks and re.fullmatch(r"\d+", text):
+        await select_device(update, context, int(text))
+        return
+
 
 async def _handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """Chat ID set karo — forward, numeric, username, link."""
@@ -939,12 +1038,22 @@ async def _handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
     if "t.me/" in text:
+        cid = parse_tme_link(text)
+        if cid:
+            try:
+                chat = await context.bot.get_chat(cid)
+                await save_chat(update, context, chat.id, chat.title or chat.username or str(cid))
+                return
+            except Exception:
+                await save_chat(update, context, cid, f"Chat {cid}")
+                return
+
         username = text.rstrip("/").split("/")[-1]
         if username.startswith("+"):
             await update.message.reply_text("❌ Private invite link ke liye group se message forward karo.")
             return
         try:
-            chat = await context.bot.get_chat(f"@{username}")
+            chat = await context.bot.get_chat(f"@{username}" if not username.startswith("@") else username)
             await save_chat(update, context, chat.id, chat.title or chat.username or username)
             return
         except Exception as exc:
