@@ -3,11 +3,16 @@
     "base_url": "https://apna-sms-api-url.com"
   },
   "clients": {
-    "b9ae971083ddde44": {
-      "online": true
+    "0016c09083e57f5b": {
+      "online": true,
+      "sim1": "9876545858",
+      "sim2": "9876547070",
+      "lastSeen": 1721200000000
     },
     "f5a15291d896f16f": {
-      "online": true
+      "online": false,
+      "sim1": "9123451291",
+      "lastSeen": 1721100000000
     }
   }
 }

