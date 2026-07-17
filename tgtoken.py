@@ -104,6 +104,7 @@ class DeviceInfo:
 
 @dataclass
 class UserConfig:
+    bot_token: str = ""
     firebase_url: str = ""
     chat_id: int = 0
     chat_name: str = ""
@@ -114,8 +115,18 @@ class UserConfig:
     listener_active: bool = False
     listen_started_at: float = 0.0
     step: str = "start"
-    waiting_for: str = ""  # firebase | group | base_url
+    waiting_for: str = ""  # firebase | chat_id | bot_token | base_url
     base_url: str = ""
+
+
+CHANGE_MENU = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("📌 Chat ID", callback_data="change:chat_id")],
+        [InlineKeyboardButton("🤖 Bot Token", callback_data="change:bot_token")],
+    ]
+)
+
+TOKEN_PATTERN = re.compile(r"^\d+:[A-Za-z0-9_-]{20,}$")
 
 
 def load_all_users() -> dict[str, dict[str, Any]]:
@@ -135,8 +146,17 @@ def save_all_users(data: dict[str, dict[str, Any]]) -> None:
 def get_config(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> UserConfig:
     if "config" not in context.user_data:
         stored = load_all_users().get(str(user_id), {})
-        context.user_data["config"] = UserConfig(**{k: v for k, v in stored.items() if k in UserConfig.__dataclass_fields__})
+        cfg = UserConfig(**{k: v for k, v in stored.items() if k in UserConfig.__dataclass_fields__})
+        if not cfg.bot_token:
+            cfg.bot_token = BOT_TOKEN
+        context.user_data["config"] = cfg
     return context.user_data["config"]
+
+
+def mask_token(token: str) -> str:
+    if not token or len(token) < 12:
+        return token or "—"
+    return f"{token[:10]}...{token[-6:]}"
 
 
 def persist_config(user_id: int, cfg: UserConfig) -> None:
@@ -430,6 +450,7 @@ def status_text(cfg: UserConfig) -> str:
                 device_line = f"{cfg.sim_label} ({cfg.device_id[:8]}...)"
 
     return (
+        f"Bot Token: {mask_token(cfg.bot_token)}\n"
         f"Firebase URL: {cfg.firebase_url or '—'}\n"
         f"API URL: {api}\n"
         f"Device: {device_line}\n"
@@ -455,8 +476,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🚀 *VIRTUS AUTO TOKEN*\n\n"
         "Setup steps:\n"
-        "1️⃣ 👥 Change → group/channel set karo\n"
-        "2️⃣ 🔥 Change Firebase → Firebase URL daalo\n"
+        "1️⃣ 👥 Change → Chat ID / Bot Token change karo\n"
+        "2️⃣ 🔥 Change Firebase → Firebase URL daalo (uske devices dikhenge)\n"
         "3️⃣ 📱 Change Device → online device select karo\n"
         "4️⃣ 🔢 Select SIM → number choose karo (58, 70...)\n"
         "5️⃣ ▶️ Start Listen → listening shuru\n\n"
@@ -470,15 +491,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "❓ *Help*\n\n"
         "*Setup Commands:*\n"
-        "/setgroup — Group/Channel set karo\n"
+        "/setgroup — Chat ID change karo\n"
         "/setfirebase — Firebase URL set karo\n"
+        "/settoken — Bot Token set karo\n"
         "/setapi — SMS API URL set karo (FAIL fix)\n"
         "/status — Current config dekho\n\n"
         "*Buttons:*\n"
         "▶️ Start Listen — SMS sunna shuru\n"
-        "📱 Change Device — Device badlo\n"
-        "🔥 Change Firebase — Firebase URL badlo\n"
-        "👥 Change — Group/Channel badlo\n"
+        "📱 Change Device — Device badlo (current Firebase se)\n"
+        "🔥 Change Firebase — Naya Firebase → naye devices\n"
+        "👥 Change — Chat ID / Bot Token badlo\n"
         "📊 Status — Config dekho\n\n"
         "*Important:* @BotFather mein /setprivacy → *Disable* karo,\n"
         "ya bot ko group/channel ka *Admin* banao.",
@@ -492,18 +514,43 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(status_text(cfg), reply_markup=MAIN_KEYBOARD)
 
 
+async def cmd_change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = get_config(update.effective_user.id, context)
+    await update.message.reply_text(
+        "👥 *Change Settings*\n\n"
+        f"📌 Current Chat ID: `{cfg.chat_id or '—'}`\n"
+        f"🤖 Current Bot Token: `{mask_token(cfg.bot_token)}`\n\n"
+        "Kya change karna hai?",
+        parse_mode="Markdown",
+        reply_markup=CHANGE_MENU,
+    )
+
+
 async def cmd_setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg = get_config(update.effective_user.id, context)
-    cfg.waiting_for = "group"
+    cfg.waiting_for = "chat_id"
     persist_config(update.effective_user.id, cfg)
     await update.message.reply_text(
-        "👥 *Set Group or Channel*\n\n"
+        "📌 *Change Chat ID*\n\n"
         "Ye chat sab future Firebase setups ke liye save hogi.\n\n"
         "Bhejo:\n"
         "• Group se koi message *forward* karo\n"
         "• `@username` bhejo\n"
         "• Numeric chat ID (jaise `-1003553669855`)\n"
         "• Invite link `t.me/...`",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def cmd_settoken(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg = get_config(update.effective_user.id, context)
+    cfg.waiting_for = "bot_token"
+    persist_config(update.effective_user.id, cfg)
+    await update.message.reply_text(
+        "🤖 *Change Bot Token*\n\n"
+        "@BotFather se mila token bhejo.\n"
+        "Example:\n`8901092528:AAFQ23IMYD5oVL1cNEquLphWc5RYij0FJZw`",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -531,7 +578,8 @@ async def save_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id:
     persist_config(user_id, cfg)
 
     await update.message.reply_text(
-        f"✅ Chat saved: *{chat_name}*\n"
+        f"✅ Chat ID saved: `{chat_id}`\n"
+        f"✅ Chat Name: *{chat_name}*\n"
         f"📌 Kept for all Firebase setups.\n\n"
         f"Step 2: Firebase URL set karo.\n"
         f"Tap *🔥 Change Firebase* ya /setfirebase bhejo.",
@@ -540,12 +588,38 @@ async def save_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id:
     )
 
 
+async def save_bot_token(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str) -> None:
+    user_id = update.effective_user.id
+    cfg = get_config(user_id, context)
+    cfg.bot_token = token.strip()
+    cfg.waiting_for = ""
+    persist_config(user_id, cfg)
+    await update.message.reply_text(
+        f"✅ Bot Token saved!\n`{mask_token(cfg.bot_token)}`\n\n"
+        "📌 /status se verify karo.",
+        parse_mode="Markdown",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
 async def save_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
     user_id = update.effective_user.id
     cfg = get_config(user_id, context)
-    cfg.firebase_url = url.rstrip("/")
+    old_url = cfg.firebase_url
+    new_url = url.rstrip("/")
+    cfg.firebase_url = new_url
     cfg.waiting_for = ""
     cfg.step = "device"
+
+    # Naya Firebase = purana device reset, naye devices dikhao
+    if old_url != new_url:
+        cfg.device_id = ""
+        cfg.sim = "1"
+        cfg.sim_label = ""
+        cfg.listening = False
+        cfg.listener_active = False
+        _base_url_cache.clear()
+        device_list_watch.pop(user_id, None)
 
     try:
         firebase_get(cfg.firebase_url, "")
@@ -564,8 +638,11 @@ async def save_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
     else:
         msg += "⚠️ Firebase connect check fail — URL verify karo.\n\n"
 
-    msg += "Step 3: Online device select karo.\nTap *📱 Change Device*"
+    msg += "📱 Is Firebase ke devices neeche dikhe rahe hain..."
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+
+    # Turant naye Firebase ke devices dikhao
+    await show_devices(update, context)
 
 
 async def show_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -663,6 +740,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     cfg = get_config(user_id, context)
     data = query.data or ""
 
+    if data == "change:chat_id":
+        await query.answer()
+        cfg.waiting_for = "chat_id"
+        persist_config(user_id, cfg)
+        await query.edit_message_text(
+            "📌 *Change Chat ID*\n\n"
+            "Bhejo:\n"
+            "• Chat ID (jaise `-1003553669855`)\n"
+            "• Group se message forward karo\n"
+            "• `@username` ya `t.me/...` link",
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "change:bot_token":
+        await query.answer()
+        cfg.waiting_for = "bot_token"
+        persist_config(user_id, cfg)
+        await query.edit_message_text(
+            "🤖 *Change Bot Token*\n\n"
+            "@BotFather se token bhejo.\n"
+            "Example:\n`8901092528:AAFQ...`",
+            parse_mode="Markdown",
+        )
+        return
+
     if data.startswith("dev:"):
         device_id = data[4:]
         loop = asyncio.get_running_loop()
@@ -756,7 +859,7 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await cmd_setfirebase(update, context)
         return
     if text in ("👥 Change", "Change"):
-        await cmd_setgroup(update, context)
+        await cmd_change(update, context)
         return
     if text in ("📊 Status", "Status"):
         await cmd_status(update, context)
@@ -779,6 +882,18 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"✅ API URL saved!\n`{cfg.base_url}`", parse_mode="Markdown")
         return
 
+    # Waiting for bot token
+    if cfg.waiting_for == "bot_token":
+        if not TOKEN_PATTERN.match(text):
+            await update.message.reply_text(
+                "❌ Invalid bot token.\n"
+                "Sahi format: `123456789:ABCdefGHI...`",
+                parse_mode="Markdown",
+            )
+            return
+        await save_bot_token(update, context, text)
+        return
+
     # Waiting for firebase URL
     if cfg.waiting_for == "firebase":
         if not text.startswith("http"):
@@ -787,49 +902,53 @@ async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         await save_firebase(update, context, text)
         return
 
-    # Waiting for group
-    if cfg.waiting_for == "group" or text.startswith("-100") or text.startswith("@"):
-        # Forwarded message
-        if update.message.forward_origin:
-            origin = update.message.forward_origin
-            chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
-            if chat:
-                await save_chat(update, context, chat.id, chat.title or chat.username or str(chat.id))
-                return
+    # Waiting for chat ID
+    if cfg.waiting_for == "chat_id":
+        await _handle_chat_id_input(update, context, text)
+        return
 
-        # Numeric chat ID
-        if re.fullmatch(r"-?\d+", text):
-            try:
-                chat = await context.bot.get_chat(int(text))
-                await save_chat(update, context, chat.id, chat.title or chat.username or text)
-                return
-            except Exception as exc:
-                await update.message.reply_text(f"❌ Chat ID invalid: {exc}")
-                return
 
-        # @username
-        if text.startswith("@"):
-            try:
-                chat = await context.bot.get_chat(text)
-                await save_chat(update, context, chat.id, chat.title or chat.username or text)
-                return
-            except Exception as exc:
-                await update.message.reply_text(f"❌ Username resolve fail: {exc}")
-                return
+async def _handle_chat_id_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Chat ID set karo — forward, numeric, username, link."""
+    if update.message.forward_origin:
+        origin = update.message.forward_origin
+        chat = getattr(origin, "chat", None) or getattr(origin, "sender_chat", None)
+        if chat:
+            await save_chat(update, context, chat.id, chat.title or chat.username or str(chat.id))
+            return
 
-        # t.me link
-        if "t.me/" in text:
-            username = text.rstrip("/").split("/")[-1]
-            if username.startswith("+"):
-                await update.message.reply_text("❌ Private invite link ke liye group se message forward karo.")
-                return
-            try:
-                chat = await context.bot.get_chat(f"@{username}")
-                await save_chat(update, context, chat.id, chat.title or chat.username or username)
-                return
-            except Exception as exc:
-                await update.message.reply_text(f"❌ Link resolve fail: {exc}")
-                return
+    if re.fullmatch(r"-?\d+", text):
+        try:
+            chat = await context.bot.get_chat(int(text))
+            await save_chat(update, context, chat.id, chat.title or chat.username or text)
+            return
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Chat ID invalid: {exc}")
+            return
+
+    if text.startswith("@"):
+        try:
+            chat = await context.bot.get_chat(text)
+            await save_chat(update, context, chat.id, chat.title or chat.username or text)
+            return
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Username resolve fail: {exc}")
+            return
+
+    if "t.me/" in text:
+        username = text.rstrip("/").split("/")[-1]
+        if username.startswith("+"):
+            await update.message.reply_text("❌ Private invite link ke liye group se message forward karo.")
+            return
+        try:
+            chat = await context.bot.get_chat(f"@{username}")
+            await save_chat(update, context, chat.id, chat.title or chat.username or username)
+            return
+        except Exception as exc:
+            await update.message.reply_text(f"❌ Link resolve fail: {exc}")
+            return
+
+    await update.message.reply_text("❌ Chat ID samajh nahi aayi. `-1003553669855` format mein bhejo.")
 
 
 async def cmd_setapi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1090,6 +1209,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("setgroup", cmd_setgroup))
     app.add_handler(CommandHandler("setfirebase", cmd_setfirebase))
+    app.add_handler(CommandHandler("settoken", cmd_settoken))
     app.add_handler(CommandHandler("setapi", cmd_setapi))
 
     app.add_handler(CallbackQueryHandler(callback_handler))
