@@ -31,7 +31,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8901092528:AAFQ23IMYD5oVL1cNEquLphWc5RYij0FJ
 DATA_FILE = Path(os.getenv("USER_DATA_FILE", "user_data.json"))
 DEFAULT_BASE_URL = os.getenv("DEFAULT_BASE_URL", "")
 SMS_TIMEOUT = float(os.getenv("SMS_TIMEOUT", "2"))
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.1"))
+OTP_POLL_INTERVAL = float(os.getenv("OTP_POLL_INTERVAL", "0.3"))
+DEVICE_POLL_INTERVAL = float(os.getenv("DEVICE_POLL_INTERVAL", "1.0"))
+FIREBASE_TIMEOUT = float(os.getenv("FIREBASE_TIMEOUT", "3"))
 EXECUTOR = ThreadPoolExecutor(max_workers=20)
 
 # base_url cache: firebase_url+device_id -> url
@@ -88,6 +90,7 @@ last_sent: dict[int, set[str]] = {}
 last_otp_seen: dict[int, float] = {}
 processed_msg_ids: set[str] = set()
 device_list_watch: dict[int, tuple[int, int, str]] = {}  # user_id -> (chat_id, msg_id, firebase_url)
+_last_device_poll: float = 0.0
 
 
 @dataclass
@@ -166,7 +169,7 @@ def persist_config(user_id: int, cfg: UserConfig) -> None:
 
 
 def firebase_get(url: str, path: str) -> Any:
-    res = requests.get(f"{url.rstrip('/')}/{path.lstrip('/')}.json", timeout=10)
+    res = requests.get(f"{url.rstrip('/')}/{path.lstrip('/')}.json", timeout=FIREBASE_TIMEOUT)
     res.raise_for_status()
     return res.json()
 
@@ -1111,7 +1114,7 @@ async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def poll_firebase_otp(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Firebase se device OTP har 0.1 sec check karo."""
+    """Firebase se device OTP check — sirf jab koi listen kar raha ho."""
     all_users = load_all_users()
     loop = asyncio.get_running_loop()
 
@@ -1176,9 +1179,15 @@ async def poll_firebase_otp(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def poll_device_list(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Device list real-time refresh — har 0.1 sec."""
+    """Device list refresh — sirf jab device screen khuli ho."""
+    global _last_device_poll
     if not device_list_watch:
         return
+
+    now = time.time()
+    if now - _last_device_poll < DEVICE_POLL_INTERVAL:
+        return
+    _last_device_poll = now
 
     loop = asyncio.get_running_loop()
 
@@ -1198,9 +1207,15 @@ async def poll_device_list(context: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 
+async def poll_background(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Single combined poll — fast, no job pile-up."""
+    await poll_firebase_otp(context)
+    await poll_device_list(context)
+
+
 def main() -> None:
     print("\n🚀 VIRTUS AUTO TOKEN BOT STARTING\n")
-    print(f"⚡ Poll interval: {POLL_INTERVAL}s | SMS timeout: {SMS_TIMEOUT}s\n")
+    print(f"⚡ OTP poll: {OTP_POLL_INTERVAL}s | Device refresh: {DEVICE_POLL_INTERVAL}s\n")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1235,10 +1250,13 @@ def main() -> None:
         )
     )
 
-    # Firebase OTP poll — har 0.1 sec
-    app.job_queue.run_repeating(poll_firebase_otp, interval=POLL_INTERVAL, first=0.5)
-    # Device list real-time refresh
-    app.job_queue.run_repeating(poll_device_list, interval=POLL_INTERVAL, first=1.0)
+    # Combined background poll (OTP + device list)
+    app.job_queue.run_repeating(
+        poll_background,
+        interval=OTP_POLL_INTERVAL,
+        first=0.5,
+        job_kwargs={"max_instances": 1, "coalesce": True},
+    )
 
     app.run_polling(drop_pending_updates=True)
 
