@@ -6,9 +6,9 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 
 # ===== CONFIG =====
-BOT_TOKEN = "8686702142:AAGmpowMhVKSKfM2wyVQ3KPgUeOdEffNwuI"
+BOT_TOKEN = "8901092528:AAFQ23IMYD5oVL1cNEquLphWc5RYij0FJZw"
 BASE_URL = ""
-TARGET_CHANNEL_ID = -1003789752936
+TARGET_CHANNEL_ID = -1003553669855
 
 # ===== LOGGING =====
 logging.basicConfig(level=logging.INFO, format="%(message)s")
