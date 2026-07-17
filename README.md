@@ -1,4 +1,4 @@
-# DYNAMO AutoToken Bot
+# Virtus Auto Token Bot
 
 Telegram par setup wala auto token / SMS relay bot — screenshot jaisa same flow.
 

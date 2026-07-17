@@ -285,7 +285,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     persist_config(update.effective_user.id, cfg)
 
     await update.message.reply_text(
-        "🚀 *DYNAMO AUTOTOKEN*\n\n"
+        "🚀 *VIRTUS AUTO TOKEN*\n\n"
         "Setup steps:\n"
         "1️⃣ 👥 Change → group/channel set karo\n"
         "2️⃣ 🔥 Change Firebase → Firebase URL daalo\n"
@@ -716,7 +716,7 @@ async def handle_channel_message(update: Update, context: ContextTypes.DEFAULT_T
             continue
 
         user_id = int(uid_str)
-        chat_name = stored.get("chat_name", "AutoToken")
+        chat_name = stored.get("chat_name", "Virtus Auto Token")
         firebase_url = stored.get("firebase_url", "")
         device_id = stored.get("device_id", "")
         sim_index = 0 if str(stored.get("sim", "1")) == "1" else 1
@@ -832,7 +832,7 @@ async def poll_firebase_otp(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
             last_sent[user_id].add(dup)
 
-            chat_name = stored.get("chat_name", "AutoToken")
+            chat_name = stored.get("chat_name", "Virtus Auto Token")
             try:
                 await notify_otp(context.bot, user_id, sender, body, chat_name)
             except Exception as exc:
@@ -841,7 +841,7 @@ async def poll_firebase_otp(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    print("\n🚀 DYNAMO AUTOTOKEN BOT STARTING\n")
+    print("\n🚀 VIRTUS AUTO TOKEN BOT STARTING\n")
     print(f"⚡ Poll interval: {POLL_INTERVAL}s | SMS timeout: {SMS_TIMEOUT}s\n")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
