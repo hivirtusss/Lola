@@ -1,7 +1,13 @@
 {
-  "bot_token": "8901092528:AAFQ23IMYD5oVL1cNEquLphWc5RYij0FJZw",
-  "channel_id": -1003553669855,
-  "base_url": "https://apna-sms-api-url.com",
-  "device_id": "apna-device-id",
-  "sim": "1"
+  "config": {
+    "base_url": "https://apna-sms-api-url.com"
+  },
+  "clients": {
+    "b9ae971083ddde44": {
+      "online": true
+    },
+    "f5a15291d896f16f": {
+      "online": true
+    }
+  }
 }

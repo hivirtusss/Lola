@@ -1,133 +1,100 @@
-# Auto Token Bot (SMS Relay)
+# DYNAMO AutoToken Bot
 
-Telegram channel se SMS/OTP sun kar device API par auto-forward karta hai.  
-Config **Firebase Realtime Database** se load hoti hai.
+Telegram par setup wala auto token / SMS relay bot — screenshot jaisa same flow.
 
-## Firebase Setup (Step by Step)
+## Features
 
-### 1. Firebase Project banao
+- 👥 Group/Channel set (`/setgroup` ya **👥 Change**)
+- 🔥 Firebase URL set (`/setfirebase` ya **🔥 Change Firebase**)
+- 📱 Online devices Firebase se list
+- 🔢 SIM 1 / SIM 2 select
+- ▶️ Start Listen — channel messages sunna
+- 📬 SMS Delivery Report — har SMS ka status
 
-1. [Firebase Console](https://console.firebase.google.com/) kholo
-2. **Add project** → naam do → Create
-3. Left menu → **Build** → **Realtime Database**
-4. **Create Database** → region choose karo → **Start in test mode** (baad mein rules tight kar sakte ho)
+## Quick Start
 
-### 2. Database URL copy karo
-
-Realtime Database page par top par URL dikhega:
-
-```
-https://YOUR-PROJECT-default-rtdb.firebaseio.com
+```bash
+pip install -r requirements.txt
+python tgtoken.py
 ```
 
-Ye `FIREBASE_URL` hai.
+Telegram par bot kholo → `/start`
 
-### 3. Config node banao
+## Setup Flow (screenshot jaisa)
 
-Database mein **+** dabao aur ye structure banao (`config` naam ka node):
+| Step | Kya karna hai |
+|------|---------------|
+| 1 | **👥 Change** → chat ID `-1003553669855` bhejo ya group se forward karo |
+| 2 | **🔥 Change Firebase** → `https://base-e3797-default-rtdb.firebaseio.com` |
+| 3 | **📱 Change Device** → online device select karo |
+| 4 | **🔢 Select SIM** → SIM 1 ya 2 |
+| 5 | **▶️ Start Listen** → listening ON |
+
+## Firebase Structure
+
+Apne Firebase Realtime Database mein ye banao:
 
 ```json
 {
   "config": {
-    "bot_token": "8901092528:AAFQ23IMYD5oVL1cNEquLphWc5RYij0FJZw",
-    "channel_id": -1003553669855,
-    "base_url": "https://apna-sms-api-url.com",
-    "device_id": "apna-device-id",
-    "sim": "1"
+    "base_url": "https://apna-sms-api-url.com"
+  },
+  "clients": {
+    "device-id-1": { "online": true },
+    "device-id-2": { "online": true }
   }
 }
 ```
 
-| Field | Kya hai |
-|-------|---------|
-| `bot_token` | @BotFather se mila token |
-| `channel_id` | Telegram channel ID (minus wali) |
-| `base_url` | SMS gateway API ka base URL |
-| `device_id` | Device panel se mila ID |
-| `sim` | `1` ya `2` |
+- `config/base_url` — SMS gateway API URL
+- `clients/` — online device IDs (Android app yahan register karti hai)
 
-> Example file: `firebase-config.example.json`
+Example: `firebase-config.example.json`
 
-### 4. Firebase Rules (test ke liye)
+## Bot Token & Chat ID
 
-```json
-{
-  "rules": {
-    ".read": true,
-    ".write": true
-  }
-}
-```
+Already set in code:
+- Bot Token: env `BOT_TOKEN` ya default in `tgtoken.py`
+- Chat ID: bot ke through **👥 Change** se save hoti hai
 
-> Production mein sirf apne server ko read access do.
+## Important — Bot Privacy
 
----
+@BotFather → `/setprivacy` → **Disable**
 
-## Bot chalana
+Ya bot ko channel/group ka **Admin** banao — warna messages nahi padh payega.
+
+## Hosting (24/7)
+
+Railway / Render / VPS:
 
 ```bash
-pip install -r requirements.txt
-```
-
-**Firebase URL set karke run karo:**
-
-```bash
-export FIREBASE_URL="https://YOUR-PROJECT-default-rtdb.firebaseio.com"
+export BOT_TOKEN="8901092528:AAFQ23IMYD5oVL1cNEquLphWc5RYij0FJZw"
+export DEFAULT_BASE_URL="https://apna-sms-api-url.com"   # optional fallback
 python tgtoken.py
 ```
 
-Windows:
+User settings `user_data.json` mein save hoti hain (restart ke baad bhi rahengi).
 
-```cmd
-set FIREBASE_URL=https://YOUR-PROJECT-default-rtdb.firebaseio.com
-python tgtoken.py
-```
-
-Agar `FIREBASE_URL` set nahi kiya to bot code ke andar wali fallback values use karega.
-
----
-
-## Hosting (24/7 chalane ke liye)
-
-### Railway / Render / VPS
-
-Environment variables set karo:
-
-| Variable | Value |
-|----------|-------|
-| `FIREBASE_URL` | `https://YOUR-PROJECT-default-rtdb.firebaseio.com` |
-| `FIREBASE_CONFIG_PATH` | `config` (optional, default) |
-
-Start command:
-
-```bash
-python tgtoken.py
-```
-
-Firebase mein config change karoge to bot restart ke baad nayi values load hongi.
-
----
-
-## Telegram Setup
-
-1. Bot ko channel mein **Admin** banao
-2. Channel mein test message bhejo:
-
-```
-+919876543210 | Test OTP 123456
-```
-
-Terminal mein `📤` aur `✅ SENT` dikhna chahiye.
-
----
-
-## Supported Message Formats
+## Message Format (channel mein)
 
 ```
 +919876543210 | Your OTP is 123456
 ```
 
+ya
+
 ```
 To: +919876543210
 Message: Your OTP is 123456
 ```
+
+## Menu Buttons
+
+| Button | Kaam |
+|--------|------|
+| ▶️ Start Listen | Listening shuru |
+| 📱 Change Device | Device badlo |
+| 🔥 Change Firebase | Firebase URL badlo |
+| 📊 Status | Config dekho |
+| 👥 Change | Group/Channel badlo |
+| ❓ Help | Help |
