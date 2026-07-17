@@ -197,6 +197,25 @@ def parse_tme_link(text: str) -> int | None:
     return None
 
 
+def chat_label(name: str) -> str:
+    """Channel/group ka naam ❤️ ke saath."""
+    if not name or name in ("—", "-"):
+        return "—"
+    clean = name.strip()
+    if clean.endswith("❤️"):
+        return clean
+    return f"{clean} ❤️"
+
+
+async def resolve_chat_name(context: ContextTypes.DEFAULT_TYPE, chat_id: int, fallback: str = "") -> str:
+    """Telegram se asli channel/group naam lao."""
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        return chat.title or chat.username or chat.full_name or fallback or str(chat_id)
+    except Exception:
+        return fallback or str(chat_id)
+
+
 def mask_token(token: str) -> str:
     if not token or len(token) < 12:
         return token or "—"
@@ -612,6 +631,10 @@ async def cmd_setfirebase(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def save_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, chat_name: str) -> None:
     user_id = update.effective_user.id
     cfg = get_config(user_id, context)
+
+    # Hamesha asli channel naam fetch karo
+    chat_name = await resolve_chat_name(context, chat_id, chat_name)
+
     cfg.chat_id = chat_id
     cfg.chat_name = chat_name
     cfg.waiting_for = ""
@@ -619,7 +642,7 @@ async def save_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id:
     persist_config(user_id, cfg)
 
     await update.message.reply_text(
-        f"✅ Chat saved: *{chat_name}*\n"
+        f"✅ Chat saved: *{chat_label(chat_name)}*\n"
         f"📌 Kept for all Firebase setups.\n\n"
         f"*Step 2:* Set your Firebase URL.\n"
         f"Tap 🔥 Set Firebase URL or send /setfirebase",
@@ -669,15 +692,15 @@ async def save_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE, url:
 
     persist_config(user_id, cfg)
 
-    chat_line = f"📌 Group/channel unchanged: *{cfg.chat_name}*\n\n" if cfg.chat_name else ""
+    channel = chat_label(cfg.chat_name) if cfg.chat_name else "—"
 
     msg = (
         f"✅ Firebase URL saved!\n"
-        f"`{cfg.firebase_url}`\n"
-        f"{chat_line}"
+        f"`{cfg.firebase_url}`\n\n"
+        f"📌 Group/channel unchanged: *{channel}*\n\n"
     )
     if connected:
-        msg += f"✅ Firebase connected!\n📌 Saved chat: *{cfg.chat_name or '—'}*\n\n"
+        msg += "✅ Firebase connected!\n\n"
     else:
         msg += "⚠️ Firebase connect check fail — URL verify karo.\n\n"
 
@@ -696,14 +719,13 @@ async def show_devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     loop = asyncio.get_running_loop()
     devices = await loop.run_in_executor(EXECUTOR, fetch_all_devices, cfg.firebase_url)
+    online = [d for d in devices if d.online]
 
-    if not devices:
+    if not online:
         await update.message.reply_text(
-            "❌ Koi device nahi mila.\n\n"
-            "Firebase mein `clients` node check karo:\n"
-            "```\n/clients/{device-id}/online: true\n/clients/{device-id}/sim1: \"9876545858\"\n```",
+            build_device_list_text(devices),
             parse_mode="Markdown",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=get_reply_keyboard(cfg),
         )
         return
 
@@ -746,7 +768,7 @@ async def select_device(update: Update, context: ContextTypes.DEFAULT_TYPE, inde
         chat_id=chat,
         text=(
             f"✅ Device: `{device_id}`\n"
-            f"📌 Saved chat: *{cfg.chat_name or '—'}*\n\n"
+            f"📌 Saved chat: *{chat_label(cfg.chat_name)}*\n\n"
             "*Step 4:* Select SIM slot.\nTap 🔢 Select SIM"
         ),
         parse_mode="Markdown",
@@ -810,7 +832,7 @@ async def start_listen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🟢 *Listening started!*\n\n"
         "Important: @BotFather mein /setprivacy → *Disable* karo,\n"
         "ya bot ko group/channel ka *Admin* banao taaki messages padh sake.\n\n"
-        f"🟢 Listening on *{cfg.chat_name}*.\n"
+        f"🟢 Listening on *{chat_label(cfg.chat_name)}*.\n"
         "Parsed messages Firebase device se SMS bhejenge.",
         parse_mode="Markdown",
         reply_markup=MAIN_KEYBOARD,
@@ -887,7 +909,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             chat_id=query.message.chat_id,
             text=(
                 f"✅ Device: *{label}* — {status}\n"
-                f"📌 Saved chat: *{cfg.chat_name or '—'}*\n\n"
+                f"📌 Saved chat: *{chat_label(cfg.chat_name)}*\n\n"
                 "Step 4: Number select karo.\nTap *🔢 Select SIM*"
             ),
             parse_mode="Markdown",
@@ -924,7 +946,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             chat_id=query.message.chat_id,
             text=(
                 "✅ *All set!*\n"
-                f"📌 Saved chat: *{cfg.chat_name or '—'}*\n\n"
+                f"📌 Saved chat: *{chat_label(cfg.chat_name)}*\n\n"
                 "*Step 5:* Start listening.\nTap ▶️ Start Listen"
             ),
             parse_mode="Markdown",
